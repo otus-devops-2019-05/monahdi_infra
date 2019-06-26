@@ -7,5 +7,6 @@ Goinng to *someinternalhost*, need to connect VPN at bastion
 and then connecting to *someinternalhost* 
 ``` ssh -i ~/.ssh/<username> <username>@< IP someinternalhost> ```
 
-Connecting data: 
-``` bastion_IP = 34.77.141.228 someinternalhost_IP = 10.132.0.3 ```
+Connecting data:
+bastion_IP = 34.77.141.228
+someinternalhost_IP = 10.132.0.3
