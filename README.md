@@ -108,3 +108,104 @@ gcloud compute firewall-rules create default-puma-server \
     --rules tcp:9292
 ```
 
+## HW5
+Установили Packer. На линукса можно поставить следующим путем: сначала
+```
+$ mkdir -p $(go env GOPATH)/src/github.com/hashicorp && cd $_
+$ git clone https://github.com/hashicorp/packer.git
+$ cd packer
+```
+затем, переносим бинарный файл в bin и на последок делаем
+```
+make dev
+```
+Проверить работоспособность можно либо 
+```
+packer -v
+```
+либо просто
+```
+packer
+```
+Далее, поставили ADC
+```
+$ gcloud auth application-default login
+```
+и сделали первый шаблон для Packer.
+Поначалу, шаблон состоял только из секции build следующего вида
+```
+{
+    "builders": [
+        {
+            "type": "googlecompute",
+            "project_id": "infra-123456",
+            "image_name": "reddit-base-{{timestamp}}",
+            "image_family": "reddit-base",
+            "source_image_family": "ubuntu-1604-lts",
+            "zone": "europe-west1-b",
+            "ssh_username": "appuser",
+            "machine_type": "f1-micro"
+        }
+    ]
+}
+```
+Добавили немного провиженинга вида
+```
+"provisioners": [
+        {
+            "type": "shell",
+            "script": "scripts/install_ruby.sh",
+            "execute_command": "sudo {{.Path}}"
+        },
+        {
+            "type": "shell",
+            "script": "scripts/install_mongodb.sh",
+            "execute_command": "sudo {{.Path}}"
+        }
+```
+И наконе проверели работоспособность получившегося образа. Для начала проверка на ошибки
+```
+$ packer validate ./ubuntu16.json
+```
+ошибок не выявила, по этому смело запустили билд
+```
+$ packer build ubuntu16.json
+```
+Все прекрасно взлетело. Сдеплоили приложение, создав ВМ из получившегося образа, к которому подключились по ssh и поставили приложение из предыдущего ДЗ
+```
+$ git clone -b monolith https://github.com/express42/reddit.git
+$ cd reddit && bundle install
+$ puma -d
+```
+Приложение прекрасно взлетело.
+Далее, добавили пару переменных в .json 
+```
+ "variables": {
+        "project_id": "",
+        "source_image_family": "",
+        "machine_type": ""
+    }
+```
+поместили их значения в json-файл variables, который находится в .gitignore.Пример файла со значением переменных называется variables.json.example.
+Кроме того, добавили пару параметров build в конечную версию образа
+
+```
+"builders": [
+        {
+            "type": "googlecompute",
+            "project_id": "{{user `project_id`}}",
+            "image_name": "reddit-base-{{timestamp}}",
+            "image_family": "reddit-base",
+            "source_image_family": "{{user `source_image_family`}}",
+            "zone": "europe-west1-d",
+            "ssh_username": "appuser",
+            "machine_type": "{{user `machine_type`}}",
+            "image_description": "This is test description",
+            "disk_size": "50",
+            "disk_type": "pd-standard",
+            "network": "default",
+            "tags": "luma-server"
+        }
+```
+Доп.задание делать не стал, ибо что такое systemd unit мне не известно, а, в отличии от прекрасного рпедыдущего ДЗ, инфомрации о том, где это можно изучить, к сожаоению нету(
+  
