@@ -1,0 +1,6 @@
+
+{
+    "project_id": " infra-123456",
+    "source_image_family": "ubuntu-1605-lts",
+    "machine_type": "f2-micro"
+  }
