@@ -207,5 +207,252 @@ $ puma -d
             "tags": "luma-server"
         }
 ```
-Доп.задание делать не стал, ибо что такое systemd unit мне не известно, а, в отличии от прекрасного рпедыдущего ДЗ, инфомрации о том, где это можно изучить, к сожаоению нету(
-  
+Получил инфу для выполнения доп.задания, попробую сделать после изучения)
+
+##HW6
+Прекрасная штука Terraform. Удаляем через веб-морду GCP ключи, что ьбы чуть позже добавить их в метаданные машины через Терру.
+Качаем Терру, в моем случае tar архив, распаковываем и добавляем бинарник в PATH.
+Так как с ДЗ затянул, читая чатик и учась на чужих граблях, сразу ставлю версию 0.11.1)
+Проверяем установку командой
+```
+terraform -v
+```
+Создаем файл main.tf, который и будет главным конфигурационным файлом. Предусмотрительно сразу в .gitignore  добавляем все файлы Терры, которые не желательно светить в публичном репозитории
+```
+*.tfstate
+*.tfstate.*.backup
+*.tfstate.backup
+*.tfvars
+.terraform/
+```
+Далее, в секции провайдеров определяем GCP
+```
+terraform {
+  # Версия terraform
+  required_version = "0.11.1"
+}
+
+provider "google" {
+  # Версия провайдера
+  version = "2.0.0"
+
+  # ID проекта
+  project = "$my_project_ID"
+  region  = "$Region"
+}
+```
+Грузим провайдер с помощью 
+```
+terraform init
+```
+В конфигурационный фал добавляем ресурс для VM
+```
+resource "google_compute_instance" "app" {
+ name = "reddit-app"
+ machine_type = "g1-small"
+ zone = "europe-west1-b"
+ # определение загрузочного диска
+ boot_disk {
+  initialize_params {
+   image = "reddit-base"
+    }
+   }
+ # определение сетевого интерфейса
+ network_interface {
+  # сеть, к которой присоединить данный      интерфейс
+  network = "default"
+  # использовать ephemeral IP для доступа  из   Интернет
+  access_config {}
+ }
+}
+```
+Первый раз используем команду для планирования изменений 
+```
+terraform plan
+```
+И отправляем Терру разворачивать ВМ, предварительно задав аргумент автоподтверждения
+```
+terraform apply -auto-approve=true
+```
+После выполнения команды появляется файл с описанием состояния terraform.tfstate
+Несколькими вариантами пыаемся найти в .state-файле внешний адрес ВМ, сначала руками, потом консрукцией 
+```
+terraform show | grep nat_ip
+```
+Однако, более правильный путь - это определить для внешнего адреса output-переменную. Создаем отдельный файл outputs.tf, в котором делается следующая запись 
+```
+output "app_external_ip" {
+  value=$google_compute_instance.app.network_interface.0.access_config.0.assigned_nat_ip}"
+}
+```
+Далее делаем 
+```
+terraform refresh
+```
+что бы output-переменная приняла значение, и... сталкиваемся с первой опечаткой в методичке) Корректируем файл outputs, выставив у атрибутов ресурса просто nat_ip вмсето assignet_nat_ip.
+Снова
+```
+terraform refresh
+```
+переменная принимает значение, которое смотрим с помощью 
+```
+terraform output
+```
+Переменную для определения адреса задали, однако, подключится по ssh к ВМ не удается...Так как удалены ключи в начале упражнения. Задаем ключи в конфигурационном файле через метаданные
+```
+metadata {
+    # путь до публичного ключа
+    ssh-keys = "appuser:${file(public_key-path)}"
+  }
+  ```
+Прогоняем эти изменения через plan и apply.
+Теперь к ВМ можно подключитсья по ssh.
+Добавляем в конфигурационный файл ресурс правила для фаервола
+```
+resource "google_compute_firewall" "firewall_puma" {
+name = "allow-puma-default"
+# Название сети, в которой действует правило
+network = "default"
+# Какой доступ разрешить
+allow {
+protocol = "tcp"
+ports = ["9292"]
+}
+# Каким адресам разрешаем доступ
+source_ranges = ["0.0.0.0/0"]
+# Правило применимо для инстансов с перечисленными тэгами
+target_tags = ["reddit-app"]
+}
+```
+Планируем и применяем изменения через уже полюбившуюся последовательность plan + apply.
+Внезапно, правило применяется только к ВМ с тегом. Добавляем в ресурс ВМ нужный тег
+```
+tags = ["reddit-app"]
+```
+И снова планируем и применяем изменения.
+Пора поиграться с проивженерами.
+Создаем директорию files.
+В нее кладем файл puma.service с примерным содержанием
+```
+[Unit]
+Description=Puma HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+User=appuser
+WorkingDirectory=/home/appuser/reddit
+ExecStart=/bin/bash -lc 'puma'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+А также файлик deploy.sh с
+```
+#!/bin/bash
+set -e
+
+APP_DIR=${1:-$HOME}
+
+git clone -b monolith https://github.com/express42/reddit.git $APP_DIR/reddit
+cd $APP_DIR/reddit
+bundle install
+
+sudo mv /tmp/puma.service /etc/systemd/system/puma.service
+sudo systemctl start puma
+sudo systemctl enable puma
+```
+Теперь можно забабахать провижинер в конфигурационный файл, который скоприует файл puma.service
+```
+provisioner "file" {
+source = "files/puma.service"
+destination = "/tmp/puma.service"
+}
+```
+Еще один, который запустит скрипт делоя
+```
+provisioner "remote-exec" {
+script = "files/deploy.sh"
+}
+```
+А также, определить параметры поключения провижионеров, забив перед ними коннектор
+```
+connection {
+type = "ssh"
+user = "appuser"
+agent = false
+# путь до приватного ключа
+private_key = "${file("~/.ssh/appuser")}"
+}
+```
+Что бы проверить работу провижионеров, нужно пересоздать ВМ. Сдлеать это можно попросив Терру при следующем apply пересоздать ВМ
+```
+terraform taint google_compute_instance.app
+```
+Снова планируем и применяем изменения. Смотрим, как взлетела пума.
+Далее, разбираемся с input-переменными. Создаем файл variables.tf для описания переменных. Выглядит он примерно так
+```
+variable project {
+description = "Project ID"
+}
+variable region {
+description = "Region"
+# Значение по умолчанию
+default = "europe-west1"
+}
+variable public_key_path {
+# Описание переменной
+description = "Path to the public key used for ssh access"
+}
+variable disk_image {
+description = "Disk image"
+}
+```
+В конфигурационном файле переменные определяются через синтаксис
+```
+"${var.var_name}"
+```
+Меняем несколько параметров в конфигурационном файле на переменные
+```
+provider "google" {
+version = "2.0.0"
+project = "${var.project}"
+region = "${var.region}"
+}
+```
+```
+...
+boot_disk {
+initialize_params {
+image = "${var.disk_image}"
+}
+}
+...
+metadata {
+ssh-keys = "appuser:${file(var.public_key_path)}"
+}
+...
+```
+Определяются переменные в файле terraform.tfvars
+Создаем его с примерно такого вида
+```
+project = "infra-179015"
+public_key_path = "~/.ssh/appuser.pub"
+disk_image = "reddit-base"
+```
+Пересоздаем все ресурсы с помощью последовательности команд
+```
+terraform destroy
+terraform plan
+terraform apply
+```
+Сталкиваюсь со своей опечаткой в конфиг файле, переименовываю переменную из publick_key_pass в public_key-pass.
+Снова дестрой, взлет, поехали)
+
+Далее, добавляем в описание переменных (файл variables.tf) переменные для коннектора ключа провижионеров и переменную для зоны. В переменную для зоны задаю параметр по умолчанию. Форматирую файлы конфигурации командой 
+```
+terraform fmt
+```
+и создаю файл с примером определения переменных terraform.tfvars.example.
+Задания со звездочкой приходится оставлять на потом, ибо есть уже долги...
