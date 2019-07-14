@@ -9,7 +9,7 @@ variable region {
   default = "europe-west1"
 }
 
-variable public_key-path {
+variable public_key_path {
   # Описание переменной
   description = "Path to the public key used for ssh access"
 }

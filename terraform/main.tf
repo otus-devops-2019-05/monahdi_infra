@@ -20,7 +20,7 @@ resource "google_compute_instance" "app" {
 
   metadata {
     # путь до публичного ключа
-    ssh-keys = "dmitriy:${file(var.public_key-path)}"
+    ssh-keys = "dmitriy:${file(var.public_key_path)}"
   }
   # определение загрузочного диска
   boot_disk {
