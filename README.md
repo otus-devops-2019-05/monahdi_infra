@@ -553,3 +553,94 @@ output storage-bucket_url {
 ```
 Инициируем Терру, проверяем создание бакетов и все дестроим.
 Доп задания как обычно, с надеждой на лучшие времена...
+
+## HW8
+С горем пополам (ибо много безуспешных попыток поставить Ansible версии 2.4 ни к чему не привели), ставим Ansible. ПОднимаем stage-инфру Терраформом, после чего проводим пару упражнений. Создаем инвентори файл с простым описанием одной машины
+```
+appserver ansible_host=35.195.186.154 ansible_user=appuser \
+ansible_private_key_file=~/.ssh/appuser
+```
+И пингуем его
+```
+ansible appserver -i ./inventory -m ping
+```
+Ту же процедуру повторяемдля ВМ с БД.
+Далее, создаем простой конфиг-файл
+```
+[defaults]
+inventory = ./inventory
+remote_user = appuser
+private_key_file = ~/.ssh/appuser
+host_key_checking = False
+retry_files_enabled = False
+```
+И теперь меняем файл инвентори на более простой
+```
+appserver ansible_host=35.195.74.54
+dbserver ansible_host=35.195.162.174
+```
+Продолжаем упражняться с модулем command, который позволяет запускать произвольные команды
+```
+ansible dbserver -m command -a uptime
+```
+после чего создаем пару групп хостов в инвентори для удобства
+```
+[app] #Это название группы
+appserver ansible_host=35.195.74.54 #Cписок хостов в данной группе
+
+[db]
+dbserver ansible_host=35.195.162.174
+```
+и теперь модно отдавать команды на целую группу
+```
+ansible app -m ping
+```
+Дальше, переносим наш инвентори в формат YAML, переопределяем путь к инвентори и пингуем все машины
+```
+ansible all -m ping -i inventory.yml
+```
+Проверяем с помощью уже известного модуля command установленые на ВМ компоненты
+```
+$ ansible app -m command -a 'ruby -v'
+
+$ ansible app -m command -a 'bundler -v'
+```
+Все круто, вот только command не запускает shell, по этому не может выполнять последовательности команд, например.
+Для этого используется модуль shell
+```
+$ ansible app -m shell -a 'ruby -v; bundler -v'
+```
+Упражняемся с проверкой статуса БД. Можно это сделать с помощью модулей command и shell
+```
+$ ansible db -m command -a 'systemctl status mongod'
+
+$ ansible db -m shell -a 'systemctl status mongod'
+```
+Однако, куда интереснее выводы systemd
+```
+$ ansible db -m systemd -a name=mongod
+```
+и service
+```
+$ ansible db -m service -a name=mongod
+```
+Модули возвращают набор переменных, которые можно использовать в последующем коде.
+Дальще, различными способами пытаемся снова склонировать git,который уже есть на серверах. Команды проходят, но changed возвращается с false, что означает отсутсвие изменений. Для интереса, реализуем простой плейбук с той же целью
+```
+- name: Clone
+  hosts: app
+  tasks:
+    - name: Clone repo
+      git:
+        repo: https://github.com/express42/reddit.git
+        dest: /home/appuser/reddit
+```
+запускаем его
+```
+ansible-playbook clone.yml
+```
+и снова не получаем изменений. Для практики, сноси дирректорию с git командой
+```
+ansible app -m command -a 'rm -rf ~/reddit'
+```
+после чего повторный запуск плейбука возвращается с изменениями на appserver.
