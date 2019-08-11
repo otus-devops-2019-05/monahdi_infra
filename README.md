@@ -644,3 +644,484 @@ ansible-playbook clone.yml
 ansible app -m command -a 'rm -rf ~/reddit'
 ```
 после чего повторный запуск плейбука возвращается с изменениями на appserver.
+
+### HW9
+Создаем единый плейбук для управления и деплоя нашего приложения. Начинаем содного сценария на плейбук. Перво наперво указываем, для какой группы хостов будет действовать плейбук:
+```
+- name: Configure hosts & deploy application # 
+  hosts: all
+```
+Пишем первый таск, который позволит указать приложению на месторасположение БД. Сразу добавляем тег, даы иметь возможность запускать отдельыне таски, а не весь сценарий.
+```
+tasks:
+- name: Change mongo config file
+  become: true 
+  template:
+    src: templates/mongod.conf.j2
+    dest: /etc/mongod.conf
+    mode: 0644
+  tags: db-tag
+```
+Создаем шаблон конфига для таска выше
+```
+# Where and how to store data.
+storage:
+  dbPath: /var/lib/mongodb
+  journal:
+    enabled: true
+
+# where to write logging data.
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+
+# network interfaces
+net:
+  port: {{ mongo_port | default('27017') }}
+  bindIp: {{ mongo_bind_ip }}
+```
+После чего можно прогнать наш сценарий. Для пробного прогона используется ключ --check, аналог terraform plan. Также указываем тег через ключ --limit, что бы запустить определенный таск
+```
+ansible-playbook reddit_app.yml --check --limit db
+```
+После ошибки, задаем в плейбуке переменную, которую использовали в шаблоне, но не объявили
+```
+- name: Configure hosts & deploy application
+  hosts: all
+  vars: 
+    mongo_bind_ip: 0.0.0.0 
+  tasks:
+  - name: Change mongo config file
+    become: true
+    template:
+      src: templates/mongod.conf.j2
+      dest: /etc/mongod.conf
+      mode: 0644
+    tags: db-tag
+```
+После чего пробный прогон проходит успешно и мы можем запустить плейбук, увидив изменения, которые он произведет.
+Добавляем в плейбук handlers - таск, который вызывается только при оповещении от других тасков. В нашем случае мы хотим, что бы БД преезапускалась после отработки нашим таском.
+```
+- name: Configure hosts & deploy application
+  hosts: all
+  vars: 
+    mongo_bind_ip: 0.0.0.0 
+  tasks:
+  - name: Change mongo config file
+    become: true
+    template:
+      src: templates/mongod.conf.j2
+      dest: /etc/mongod.conf
+      mode: 0644
+    tags: db-tag
+    notify: restart mongod
+  handlers:
+  - name: restart mongod
+    become: true
+    service: name=mongod state=restarted
+```
+Применяем плейбук.
+Далее, создаем юнит-файл для будущего переноса на сервер приложения
+```
+[Unit]
+Description=Puma HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/appuser/db_config
+User=appuser
+WorkingDirectory=/home/appuser/reddit
+ExecStart=/bin/bash -lc 'puma'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+В юнит-файле есть строка для чтения переменных. Создаем файл для этого со следующим содержанием
+```
+DATABASE_URL={{ db_host }}
+```
+
+Добавляем в сценарий переменную адреса сервера (внутренний адрес базы). Добавляем таск для копирования файла (модуль copy) и автозапуска приложения (модуль systemd). В таски также добавляем задачу для копирования созданного ранее шаблона с переменой адреса. Кроме того, добавляем handlers, указывающий на изменения юнит-файла и отправляющий его перечитывать
+```
+- name: Configure hosts & deploy application
+  hosts: all
+  vars: 
+    mongo_bind_ip: 0.0.0.0
+    db_host: 10.132.0.2
+  tasks:
+  - name: Change mongo config file
+    become: true
+    template:
+      src: templates/mongod.conf.j2
+      dest: /etc/mongod.conf
+      mode: 0644
+    tags: db-tag
+    notify: restart mongod
+
+  - name: Add unit file for Puma
+    become: true
+    copy:
+      src: files/puma.service
+      dest: /etc/systemd/system/puma.service
+    tags: app-tag
+    notify: reload puma
+
+  - name: Add config for DB connection
+    template:
+      src: templates/db_config.j2
+      dest: /home/appuser/db_config
+    tags: app-tag
+
+  - name: enable puma
+    become: true
+    systemd: name=puma enabled=yes
+    tags: app-tag
+
+  handlers:
+  - name: restart mongod
+    become: true
+    service: name=mongod state=restarted
+  
+  - name: restart mongod
+    become: true
+    service: name=mongod state=restarted
+
+  - name: reload puma
+    become: true
+    systemd: name=puma state=restarted
+```
+Делаем пробный прогон плейбука и применяем его к хостам app (только сценарии app-tag)
+```
+$ ansible-playbook reddit_app.yml --check --limit app --tags app-tag
+$ ansible-playbook reddit_app.yml --limit app --tags app-tag
+```
+Переходим к деплою. Добавляем через модули git и bundl клонирование актуальной репы приложения и установку рубей
+```
+tasks:
+...
+- name: Fetch the latest version of application code
+  git:
+    repo: 'https://github.com/express42/reddit.git'
+    dest: /home/appuser/reddit
+    version: monolith # <-- Указываем нужную ветку
+  tags: deploy-tag
+  notify: reload puma
+- name: Bundle install
+  bundler:
+    state: present
+    chdir: /home/appuser/reddit
+  tags: deploy-tag
+```
+Деплоим
+```
+$ ansible-playbook reddit_app.yml --check --limit app --tags deploy-tag
+$ ansible-playbook reddit_app.yml --limit app --tags deploy-tag
+```
+Все круто, на каждый раз для запуска нужных сценариев нужно указывать необходимые теги. Не очень удобно и для решения этого вопроса предлагается разбить большой сценарий на несколько поменьше, каждый со своей ролью.
+Сценарий для БД
+```
+- name: Configure MongoDB
+  hosts: db
+  tags: db-tag
+  become: true
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  tasks:
+    - name: Change mongo config file
+      template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        mode: 0644
+      notify: restart mongod
+
+  handlers:
+  - name: restart mongod
+    service: name=mongod state=restarted
+```
+Сценарий для инстанса приложения
+```
+- name: Configure MongoDB
+  hosts: db
+  tags: db-tag
+  become: true
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  tasks:
+    - name: Change mongo config file
+      template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        mode: 0644
+      notify: restart mongod
+
+  handlers:
+  - name: restart mongod
+    service: name=mongod state=restarted
+
+- name: Configure App
+  hosts: app
+  tags: app-tag
+  become: true
+  vars:
+   db_host: 10.132.0.2
+  tasks:
+    - name: Add unit file for Puma
+      copy:
+        src: files/puma.service
+        dest: /etc/systemd/system/puma.service
+      notify: reload puma
+
+    - name: Add config for DB connection
+      template:
+        src: templates/db_config.j2
+        dest: /home/appuser/db_config
+        owner: appuser
+        group: appuser
+
+    - name: enable puma
+      systemd: name=puma enabled=yes
+
+  handlers:
+  - name: reload puma
+    systemd: name=puma state=restarted
+```
+И сценарий для деплоя. Итоговый сценарий
+```
+- name: Configure MongoDB
+  hosts: db
+  tags: db-tag
+  become: true
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  tasks:
+    - name: Change mongo config file
+      template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        mode: 0644
+      notify: restart mongod
+
+  handlers:
+  - name: restart mongod
+    service: name=mongod state=restarted
+
+
+- name: Configure App
+  hosts: app
+  tags: app-tag
+  become: true
+  vars:
+   db_host: 10.132.0.2
+  tasks:
+    - name: Add unit file for Puma
+      copy:
+        src: files/puma.service
+        dest: /etc/systemd/system/puma.service
+      notify: reload puma
+
+    - name: Add config for DB connection
+      template:
+        src: templates/db_config.j2
+        dest: /home/appuser/db_config
+        owner: appuser
+        group: appuser
+
+    - name: enable puma
+      systemd: name=puma enabled=yes
+
+  handlers:
+  - name: reload puma
+    systemd: name=puma state=reloaded
+
+
+- name: Deploy App
+  hosts: app
+  tags: deploy-tag
+  tasks:
+    - name: Fetch the latest version of application code
+      git:
+        repo: 'https://github.com/express42/reddit.git'
+        dest: /home/appuser/reddit
+        version: monolith
+      notify: restart puma
+
+    - name: bundle install
+      bundler:
+        state: present
+        chdir: /home/appuser/reddit
+
+  handlers:
+  - name: restart puma
+    become: true
+    systemd: name=puma state=restarted
+```
+
+Пересоздаем инфраструктуру и запускаем каждый сценарий
+```
+$ ansible-playbook reddit_app2.yml --tags db-tag --check
+$ ansible-playbook reddit_app2.yml --tags db-tag
+$ ansible-playbook reddit_app2.yml --tags app-tag --check
+$ ansible-playbook reddit_app2.yml --tags app-tag
+$ ansible-playbook reddit_app2.yml --tags deploy-tag --check
+$ ansible-playbook reddit_app2.yml --tags deploy-tag
+```
+Стало удобнее, но не на много. По этому для большего удобства...создаем несколько плейбуков) Также, как и по сценариям, по трем ролям: приложение, БД, деплой.
+Убираем из сценариев теги и разносим по плейбукам. Для БД:
+```
+- name: Configure MongoDB
+  hosts: db
+  become: true
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  tasks:
+    - name: Change mongo config file
+      template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        mode: 0644
+      notify: restart mongod
+
+  handlers:
+  - name: restart mongod
+    service: name=mongod state=restarted
+```
+Для приложения
+```
+- name: Configure App
+  hosts: app
+  become: true
+  vars:
+   db_host: 10.132.0.2
+  tasks:
+    - name: Add unit file for Puma
+      copy:
+        src: files/puma.service
+        dest: /etc/systemd/system/puma.service
+      notify: reload puma
+
+    - name: Add config for DB connection
+      template:
+        src: templates/db_config.j2
+        dest: /home/appuser/db_config
+        owner: appuser
+        group: appuser
+
+    - name: enable puma
+      systemd: name=puma enabled=yes
+
+  handlers:
+  - name: reload puma
+    systemd: name=puma state=restarted
+```
+И для деплоя
+```
+- name: Deploy App
+  hosts: app
+  tasks:
+    - name: Fetch the latest version of application code
+      git:
+        repo: 'https://github.com/express42/reddit.git'
+        dest: /home/appuser/reddit
+        version: monolith
+      notify: restart puma
+
+    - name: bundle install
+      bundler:
+        state: present
+        chdir: /home/appuser/reddit
+
+  handlers:
+  - name: restart puma
+    become: true
+    systemd: name=puma state=restarted
+```
+А теперь можно сделать "главный" плейбук, который будет включать все остальные
+```
+- import_playbook: db.yml
+- import_playbook: app.yml
+- import_playbook: deploy.yml
+```
+Пересоздаем инфру, меняем параметры в инвентори и погнали
+```
+$ ansible-playbook site.yml --check
+$ ansible-playbook site.yml
+```
+И наконец то, что заняло три часа траблшутинга и ни к чему не привело)
+Меняем провиженеры в конфигурации Пакера со скриптов на плейбуки Ансибла.
+Плейбук для образа приложения
+```
+
+- name: Install Ruby
+  hosts: all
+  become: true
+  tasks:
+  - name: Update apt packages
+    apt: 
+      update_cache: true
+  - name:
+    apt:
+      name: "{{packages}}"
+      state: present
+    vars:
+      packages:
+      - ruby-full
+      - ruby-bundler
+      - build-essential
+```
+и плейбук для образа БД
+```
+- name: Install DB
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Install ppa key
+      apt_key:
+        keyserver: hkp://keyserver.ubuntu.com:80
+        id: EA312927
+
+    - name: Update apt packages
+      apt: 
+        update_cache: true
+
+    - name: App repo
+      apt_repository:
+        repo: deb [ arch=amd64,arm64 ] http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.2 multiverse
+        state: present
+
+    - name: Install DB
+      apt:
+        name: mongodb-org
+        state: present
+
+    - name: Enable autostart DB
+      systemd:
+        name: mongod
+        enabled: yes
+```
+Меняем провижионеры в Пакере
+```
+"provisioners": [
+  {
+    "type": "ansible",
+    "playbook_file": "ansible/packer_app.yml"
+  }
+]
+```
+и
+```
+"provisioners": [
+  {
+    "type": "ansible",
+    "playbook_file": "ansible/packer_db.yml"
+  }
+]
+Ключ force - для слабаков, по этому сносим имеющиеся образы и начинаем подымать те, что только что создали...
+И тут внезапно начинаются какие то сложности...Образ приложения поднимается при последней конфигурации, а вот БД ни в какую не хочет...Проверки Тревиса проходят, то есть гипотетически все корректно. Но образ удален и новый не поднимается) Отступать никуда...После трех часов мучений и помощи сообщества, в плейбук БД при установке базы был добавлен параметр
+```
+allow_unauthenticated: yes
+```
+так как в противном случае GCP по неведомым причинам считаем установку БД установкой из недоверенного источника...
