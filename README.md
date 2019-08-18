@@ -1119,9 +1119,223 @@ $ ansible-playbook site.yml
     "playbook_file": "ansible/packer_db.yml"
   }
 ]
+```
 Ключ force - для слабаков, по этому сносим имеющиеся образы и начинаем подымать те, что только что создали...
 И тут внезапно начинаются какие то сложности...Образ приложения поднимается при последней конфигурации, а вот БД ни в какую не хочет...Проверки Тревиса проходят, то есть гипотетически все корректно. Но образ удален и новый не поднимается) Отступать никуда...После трех часов мучений и помощи сообщества, в плейбук БД при установке базы был добавлен параметр
 ```
 allow_unauthenticated: yes
 ```
 так как в противном случае GCP по неведомым причинам считаем установку БД установкой из недоверенного источника...
+
+###HW10
+Продолжаем нарищаивать удобство) В этот раз начинаем с создания ролей. Инициируем создание ролей db и app с помощью команд
+```
+$ ansible-galaxy init app
+$ ansible-galaxy init db
+```
+Получаем две папке со структурой, принятой в Ansible Galaxy. Копируем тас из плейбука app в main плейбук директории tasks роли db. В директорию шаблонов этой же роли переносим конфиг БД из директории ansible/templates. Так как такс автомотически проверит наличие шаблонов в директории роли, ссылки на них из такска можно убрать и написать просто:
+```
+# tasks file for db
+- name: Change mongo config file
+  template:
+    src: mongod.conf.j2
+    dest: /etc/mongod.conf
+    mode: 0644
+  notify: restart mongod
+```
+Аналогично переносим хендлер из плейбука в роль
+```
+# handlers file for db
+- name: restart mongod
+  service: name=mongod state=restarted
+```
+В секцию роли defaults переносим секцию переменных
+```
+# defaults file for db
+mongo_port: 27017
+mongo_bind_ip: 127.0.0.1
+```
+И повторяем анологичные действия с ролью app. В переменную в директории defaults вставляем адрес БД
+```
+db_host: 127.0.0.1
+```
+Теперь в плейбуках можно использовать роли и превести плейбук app.yml к виду
+```
+- name: Configure App
+  hosts: app
+  become: true
+
+  vars:
+    db_host: 10.132.0.2
+
+  roles:
+  - app
+```
+а плейбук БД к виду
+```
+- name: Configure DB
+  hosts: db
+  become: true
+
+  vars:
+    mongo_bind_ip: 0.0.0.0
+
+  roles:
+    - db
+```
+Дальше, тренируемся с окружениями. В Терраформе описано два, будем управлять каждым из Ansible. Создаем директорию environments, в ней две поддиректории - stage и prod. В каждую помещаем свой файл inventory (используемый ранее удаляем). Определяем окружением по умолчанию stage вот такой не хитрой правкой конфига
+```
+[defaults]
+inventory = ./environments/stage/inventory
+remote_user = appuser
+private_key_file = ~/.ssh/appuser
+host_key_checking = False
+```
+Дальше, в каждой из поддиректорий окружения создаем директорию group_vars, где будем создавать файлы для определения переменных для целых групп хостов. Файлы сии должны соответствовать названиям групп в инвентори-файле.
+Создаем в stage/group_vars файл app и переносим в него содержимое vars из плейбука app.yml
+```
+db_host: 10.132.0.2
+```
+при этом переменные из плейбука удаляем. Те же действия производим при создании там же файла db
+```
+mongo_bind_ip: 0.0.0.0
+```
+Так же создаем файл переменных all следующего содержания
+```
+env: stage
+```
+так как по умолчанию создастя группа all и для доступности переменных всем хостам, нужно указать окружение.
+Копируем все файлы group_vars из stage в prod, с изменением только в переменной all
+```
+env: prod
+```
+Для возможности будущего вывода информации об окружениях в переменных ролей добавляем строчку определения информации об окружении. Для /roles/app/defaults/main.yml
+```
+# defaults file for app
+db_host: 127.0.0.1
+env: local
+```
+Для /roles/db/defaults/main.yml
+```
+# defaults file for db
+mongo_port: 27017
+mongo_bind_ip: 127.0.0.1
+env: local
+```
+И теперь в таск роли app и db добавляем
+```
+# tasks file for app
+- name: Show info about the env this host belongs to
+  debug:
+    msg: "This host is in {{ env }} environment!!!"
+```
+Меняем структуру нашей директории ansible, что бы навести там порядок, а заодно корректируем конфиг следующим образом
+```
+[defaults]
+inventory = ./environments/stage/inventory
+remote_user = appuser
+private_key_file = ~/.ssh/appuser
+# Отключим проверку SSH Host-keys (поскольку они всегда разные для новых инстансов)
+host_key_checking = False
+# Отключим создание *.retry-файлов (они нечасто нужны, но мешаются под руками)
+retry_files_enabled = False
+# # Явно укажем расположение ролей (можно задать несколько путей через ; )
+roles_path = ./roles
+[diff]
+# Включим обязательный вывод diff при наличии изменений и вывод 5 строк контекста
+always = True
+context = 5
+```
+Проверяем, все ли работает, пересобирая инфру и запуская плейбуки поочередно для stage и prod. Все работает, мы молодцы.
+Далее, учимся работать с комюнити-ролями на примере nginx. Добавляем файл requirements.yml в директории окружения stage и prod. Этой файлик для зависимостей ролей. Туда вписываем 
+```
+- src: jdauphant.nginx
+  version: v2.21.1
+```
+Устанавливаем роль командой 
+```
+ansible-galaxy install -r environments/stage/requirements.yml
+```
+Так как комитить комьюнити-роли плохая практика, в гитигнор добавляем jdauphant.nginx.
+В grop_vars/app добавляем 
+```
+nginx_sites:
+    default:
+        - listen 80
+        - server_name "reddit"
+        - location / {
+            proxy_pass http://127.0.0.1:9292;
+          }
+```
+для минимальной настройки nginx. В конфиге Террафор открываем для прилоджения порт 80, внеся коррективы в модуль app/main.tf
+```
+resource "google_compute_firewall" "firewall_puma" {
+    name = "allow-puma-default"
+    network = "default"
+    allow {
+        protocol = "tcp", ports = ["9292"]
+        protocol = "tcp", ports = ["80"]
+            }
+    source_ranges = ["0.0.0.0/0"]
+    target_tags = ["reddit-app"]
+```
+Добавляем вызов роли в плейбук приложения
+```
+  roles:
+  - app
+  - jdauphant.nginx
+```
+и, запустив общий плейбук, убеждаемся в том, что приложение доступно по порту 80.
+Немного поупражняемся с Ansible Vault. Создаем файл vault.key out-of-tree. В файл конфигурации добавляем опцию 
+```
+[defaults]
+...
+vault_password_file = ~/.ansible/vault.key
+```
+Добавляем плейбук для создания пользователей users.yml
+```
+- name: Create users
+  hosts: all
+  become: true
+
+  vars_files:
+    - "{{ inventory_dir }}/credentials.yml"
+
+  tasks:
+    - name: create users
+      user:
+        name: "{{ item.key }}"
+        password: "{{ item.value.password|password_hash('sha512', 65534|random(seed=inventory_hostname)|string) }}"
+        groups: "{{ item.value.groups | default(omit) }}"
+      with_dict: "{{ credentials.users }}"
+```
+И для каждого окружения создаем файл credentials.yml с данными пользователей. Для prod
+```
+credentials:
+  users:
+    admin:
+      password: admin123
+      groups: sudo
+```
+для stage
+```
+credentials:
+  users:
+    admin:
+      password: qwerty123
+      groups: sudo
+    qauser:
+      password: test123
+```
+Бахаем шифрование
+```
+$ ansible-vault encrypt environments/prod/credentials.yml
+$ ansible-vault encrypt environments/stage/credentials.yml
+```
+И убеждаемся в том, что все зашифровалось, а пользователи создались. В основной плейбук также добавляем вызов плейбука для создания пользователей
+```
+- import_playbook: db.yml
+- import_playbook: app.yml
+- import_playbook: deploy.yml
+- import_playbook: users.yml
+```
