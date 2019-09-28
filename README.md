@@ -1339,3 +1339,429 @@ $ ansible-vault encrypt environments/stage/credentials.yml
 - import_playbook: deploy.yml
 - import_playbook: users.yml
 ```
+### HW10
+Для примера с локальной разработкой, используем Vagrant. Устанавливаем VirtualBox, который является одним из проивижионеров вагранта, а также сам вагрант. Создаем в директории с ансиблом файл Vagrantfile, в который добавляем описание двух виртуалок, аналогичных с теми, что в GCP создавали с помошью терраформа.
+```
+Vagrant.configure("2") do |config|
+
+  config.vm.provider :virtualbox do |v|
+    v.memory = 512
+  end
+
+  config.vm.define "dbserver" do |db|
+    db.vm.box = "ubuntu/xenial64"
+    db.vm.hostname = "dbserver"
+    db.vm.network :private_network, ip: "10.10.10.10"
+  end
+  
+  config.vm.define "appserver" do |app|
+    app.vm.box = "ubuntu/xenial64"
+    app.vm.hostname = "appserver"
+    app.vm.network :private_network, ip: "10.10.10.20"
+  end
+end
+```
+Поднимаем созданные виртуалки:
+```
+vagrant up
+```
+Командой vagrant box list можно посмотреть, какие боксы скачались на локальную машину, а командой vagrant status проверить статус того, какие ВМ запущены.
+Так как в дальнейшем используется Ансибл, добавляем его описание как провижионера в вагрантфайл. Файл теперь выглядит вот так:
+```
+Vagrant.configure("2") do |config|
+
+  config.vm.provider :virtualbox do |v|
+    v.memory = 512
+  end
+
+  config.vm.define "dbserver" do |db|
+    db.vm.box = "ubuntu/xenial64"
+    db.vm.hostname = "dbserver"
+    db.vm.network :private_network, ip: "10.10.10.10"
+
+    db.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "db" => ["dbserver"],
+      "db:vars" => {"mongo_bind_ip" => "0.0.0.0"}
+      }
+    end
+  end
+
+  config.vm.define "appserver" do |app|
+    app.vm.box = "ubuntu/xenial64"
+    app.vm.hostname = "appserver"
+    app.vm.network :private_network, ip: "10.10.10.20"
+  end
+end
+```
+Если нужно применить провижионер прямо сейчас, а не при следующем запуске ВМ, можно воспользоваться командой
+```
+vagrant provision dbserver
+```
+Если команду запустить сейчас, применение произойдетс с ошибкой из-за отсутсвия питона. Что бы сделать все по красоте и добавить питон на все запускаемые в последующем машины, создаем еще один плейбук base.yml следующего содержания:
+```
+- name: Check && install python
+  hosts: all
+  become: true
+  gather_facts: False
+
+  tasks:
+    - name: Install python for Ansible
+      raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal)
+      changed_when: False
+```
+По ходу дела удаляем из site.yml неиспользуемый в задание плейбук user.yml.
+Теперь провижионер применится, но с ошибкой об отсутсвии монги. Для установки монги, доабвляем в роль db таск install_mongo.yml
+```
+- name: Add APT key
+  apt_key:
+    id: "EA312927"
+    keyserver: keyserver.ubuntu.com
+  tags: install
+
+- name: Add APT repository
+  apt_repository:
+    repo: deb [ arch=amd64,arm64 ] http://repo.mongodb.org/apt/ubuntu xenial/mongodb-org/3.2 multiverse
+    state: present
+  tags: install
+
+- name: Install mongodb package
+  apt:
+    name: mongodb-org
+    state: present
+  tags: install
+
+- name: Configure service supervisor
+  systemd:
+    name: mongod
+    enabled: yes
+    state: started
+  tags: install
+```
+Такс по управлению БД так же выносим в отдельный файл config_mongo.yml
+```
+- name: Change mongo config file
+  template:
+    src: templates/mongod.conf.j2
+    dest: /etc/mongod.conf
+    mode: 0644
+  notify: restart mongod
+```
+И меняем файл main для вызова тасков в нужном порядке
+```
+- name: Show info about the env this host belongs to
+  debug:
+    msg: "This host is in {{ env }} environment!!!"
+
+- include: install_mongo.yml
+- include: config_mongo.yml
+```
+Снова запускаем применение провижионера и теперь оно проходит успешно.
+Аналогично выносим в отдельные таски задания для роли app. Создаем файл ruby.yml с таксами для установки руби:
+```
+- name: Install ruby and rubygems and required packages
+  apt: "name={{ item }} state=present"
+  with_items:
+    - ruby-full
+    - ruby-bundler
+    - build-essential
+  tags: ruby
+```
+  И файл для пумы puma.yml:
+```
+- name: Add unit file for Puma
+  copy:
+    src: puma.service
+    dest: /etc/systemd/system/puma.service
+  notify: reload puma
+
+- name: Add config for DB connection
+  template:
+    src: db_config.j2
+    dest: /home/appuser/db_config
+    owner: appuser
+    group: appuser
+
+- name: enable puma
+  systemd: name=puma enabled=yes
+```
+Опять же в файле main делаем вызов тасков в нужном порядке:
+```
+- name: Show info about the env this host belongs to
+  debug:
+    msg: "This host is in {{ env }} environment!!!"
+
+- include: ruby.yml
+- include: puma.yml
+```
+Добавляем в вагрантфайл провижионер для хоста приложения
+```
+Vagrant.configure("2") do |config|
+
+  config.vm.provider :virtualbox do |v|
+    v.memory = 512
+  end
+
+  config.vm.define "dbserver" do |db|
+    db.vm.box = "ubuntu/xenial64"
+    db.vm.hostname = "dbserver"
+    db.vm.network :private_network, ip: "10.10.10.10"
+
+    db.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "db" => ["dbserver"],
+      "db:vars" => {"mongo_bind_ip" => "0.0.0.0"}
+      }
+    end
+  end
+
+  config.vm.define "appserver" do |app|
+    app.vm.box = "ubuntu/xenial64"
+    app.vm.hostname = "appserver"
+    app.vm.network :private_network, ip: "10.10.10.20"
+
+    app.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "app" => ["appserver"],
+      "app:vars" => { "db_host" => "10.10.10.10"}
+      }
+    end
+  end
+end
+```
+Далее, добавляем переменную пользователя, ибо иначе провижионер будет вылетать с ошибкой созданиядиректории для настройки подключения к БД, ибо нет самого пользователя, и, соответсвенно, его директории. В файле main роли приложения доабвляем переменную пользователя
+```
+deploy_user: appuser
+```
+И начинаем менять таски. Для начала меняем таск пумы, где модуль copy меняем на template для возможности параметризации файла настройки, а также все упоминания о пользователе заменяем на переменную
+```
+---
+- name: Add unit file for Puma
+  template:
+    src: puma.service.j2
+    dest: /etc/systemd/system/puma.service
+  notify: reload puma
+
+- name: Add config for DB connection
+  template:
+    src: db_config.j2
+    dest: "/home/{{ deploy_user }}/db_config"
+    owner: "{{ deploy_user }}"
+    group: "{{ deploy_user }}"
+
+- name: enable puma
+  systemd: name=puma enabled=yes
+```
+И меняем сам файл. Переименовываем его из puma.service в puma.service.j2 и переносим из директории app/files в app/templates. Внутри файла все упоминания о пользователе меняем на переменные:
+```
+[Unit]
+Description=Puma HTTP Server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/{{ deploy_user }}/db_config
+User={{ deploy_user }}
+WorkingDirectory=/home/{{ deploy_user }}/reddit
+ExecStart=/bin/bash -lc 'puma'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+Кроме того, упоминания о пользователе мы встречаем в deploy.yml, который вызывавется при запуске site.yml. Меняем и там значения на переменную
+```
+- name: Deploy App
+  hosts: app
+  vars:
+    deploy_user: appuser
+
+  tasks:
+    - name: Fetch the latest version of application code
+      git:
+        repo: 'https://github.com/express42/reddit.git'
+        dest: "/home/{{ deploy_user }}/reddit"
+        version: monolith
+      notify: restart puma
+
+    - name: bundle install
+      bundler:
+        state: present
+        chdir: "/home/{{ deploy_user }}/reddit"
+
+  handlers:
+  - name: restart puma
+    become: true
+    systemd: name=puma state=restarted
+```
+Кроме того, в вагрант-файле нужно переопределить имя пользователя на то, которое по умолчянию использует бокс. Идя по граблям коллег, меняем его на vagrant:
+```
+Vagrant.configure("2") do |config|
+
+  config.vm.provider :virtualbox do |v|
+    v.memory = 512
+  end
+
+  config.vm.define "dbserver" do |db|
+    db.vm.box = "ubuntu/xenial64"
+    db.vm.hostname = "dbserver"
+    db.vm.network :private_network, ip: "10.10.10.10"
+
+    db.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "db" => ["dbserver"],
+      "db:vars" => {"mongo_bind_ip" => "0.0.0.0"}
+      }
+    end
+  end
+
+  config.vm.define "appserver" do |app|
+    app.vm.box = "ubuntu/xenial64"
+    app.vm.hostname = "appserver"
+    app.vm.network :private_network, ip: "10.10.10.20"
+
+    app.vm.provision "ansible" do |ansible|
+      ansible.playbook = "playbooks/site.yml"
+      ansible.groups = {
+      "app" => ["appserver"],
+      "app:vars" => { "db_host" => "10.10.10.10"}
+      }
+      ansible.extra_vars = {
+        "deploy_user" => "vagrant"
+      }
+    end
+  end
+end
+```
+Применяем провиженинг и работу приложения, все работает. После удаляем конфигурацию и поднимаем ее снова, что бы убедиться, что все работает
+```
+vagrant destroy -f
+vagrant up
+```
+С ошибкой вываливается руби. Добавляем в ruby.yml обновление пакетов
+```
+- name: Only run "update_cache=yes" if the last one is more than 3600 seconds ago
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Install ruby and rubygems and required packages
+  apt: "name={{ item }} state=present"
+  with_items:
+    - ruby-full
+    - ruby-bundler
+    - build-essential
+  tags: ruby
+```
+Теперь все работает.
+Далее, для тестирования ролей нам понадобится Molecule и Testinfra. Ставим их, добавив в requirements.txt следующие строки
+```
+molecule>=2.6
+testinfra>=1.10
+python-vagrant>=0.5.15
+```
+и запустив pip
+```
+pip install -r requirements.txt
+```
+Далее, в директории роли db инициируем создание заготовки тестов
+```
+molecule init scenario --scenario-name default -r db -d vagrant
+```
+Добавляем несколько тестов для примера в db/molecule/default/tests/test_default.py
+```
+import os
+
+import testinfra.utils.ansible_runner
+
+testinfra_hosts = testinfra.utils.ansible_runner.AnsibleRunner(
+    os.environ['MOLECULE_INVENTORY_FILE']).get_hosts('all')
+
+# check if MongoDB is enabled and running
+def test_mongo_running_and_enabled(host):
+    mongo = host.service("mongod")
+    assert mongo.is_running
+    assert mongo.is_enabled
+
+# check if configuration file contains the required line
+def test_config_file(host):
+    config_file = host.file('/etc/mongod.conf')
+    assert config_file.contains('bindIp: 0.0.0.0')
+    assert config_file.is_file
+```
+Описание тестовой машины можно найти в db/molecule/default/molecule.yml, в нашем слуае ничео менять не нужно, т.к. уже используется нужный бокс.
+Создается ВМ для тестирования командой
+```
+molecule create
+```
+Посмотреть список созданых машин можно командой molecule list, после чего можно по SSH например провалиться внутрь ВМ по её имени.
+Молексула генерит плейбук для проверки роли здесь db/molecule/default/playbook.yml. В него добавляем параметр become и переменную адреса
+```
+- name: Converge
+  become: true
+  hosts: all
+  vars:
+    mongo_bind_ip: 0.0.0.0
+  roles:
+    - role: db
+```
+Применяем плейбук к созданному хосту и запускаем тест
+```
+molecule converge
+molecule verify
+```
+Далее, добавляем к тесту проверку нужного БД порта
+```
+import os
+
+import testinfra.utils.ansible_runner
+
+testinfra_hosts = testinfra.utils.ansible_runner.AnsibleRunner(
+    os.environ['MOLECULE_INVENTORY_FILE']).get_hosts('all')
+
+# check if MongoDB is enabled and running
+def test_mongo_running_and_enabled(host):
+    mongo = host.service("mongod")
+    assert mongo.is_running
+    assert mongo.is_enabled
+
+# check if configuration file contains the required line
+def test_config_file(host):
+    config_file = host.file('/etc/mongod.conf')
+    assert config_file.contains('bindIp: 0.0.0.0')
+    assert config_file.is_file
+
+# check if db listning port 27017
+def test_mongo_port(host):
+    assert host.socket("tcp://0.0.0.0:27017").is_listening
+```
+Прогоняем, работает.
+И на последок, в плейбуках пакера применяем роли. Для этого заменяем содержимое плейбуков на
+```
+- name: Provisioner for app image
+  hosts: all
+  become: yes
+  roles:
+    - app
+```
+и
+```
+- name: Provisioner for app image
+  hosts: all
+  become: yes
+  roles:
+    - db
+```
+Однако пакер благополучно не видит роли...Добавляем в .json путь к ролям
+```
+"ansible_env_vars": ["ANSIBLE_ROLES_PATH={{ pwd }}/ansible/roles"]
+```
+а к json прилодения еще и теги руби
+```
+"extra_arguments": ["--tags","ruby"]
+```
+Все взлетает)
