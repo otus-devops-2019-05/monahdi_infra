@@ -1,5 +1,5 @@
-- name: Install Ruby
+- name: Provisioner for app image
   hosts: all
-  become: true
+  become: yes
   roles:
-    -app
+    - app
