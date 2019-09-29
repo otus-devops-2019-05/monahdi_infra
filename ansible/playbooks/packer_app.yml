@@ -1,17 +1,5 @@
-
-- name: Install Ruby
+- name: Provisioner for app image
   hosts: all
-  become: true
-  tasks:
-  - name: Update apt packages
-    apt: 
-      update_cache: true
-  - name:
-    apt:
-      name: "{{packages}}"
-      state: present
-    vars:
-      packages:
-      - ruby-full
-      - ruby-bundler
-      - build-essential
+  become: yes
+  roles:
+    - app
